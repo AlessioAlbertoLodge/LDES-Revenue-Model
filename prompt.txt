@@ -1,0 +1,1357 @@
+I want to make a Long Duration Energy Storage merchant (day head market) revenue calculator code on Streamlit. Right now, I have a short duration BESS revenue webapp - which I just want to slightly change to make it work for LDES. Basically, what it should do is optimize over one year (starting from Jan), instead of just on the day ahead, utilizing a perfect prediction i.e. doing this in a back test fashion (using a years worth of day-ahead prices). The LDES parameters can be selected, but are by default 200MWh, 2 MW (max change and discharge - so 100 h duration) with a 60% round trip efficiency. Let me give you the entire code base and you provide me the basic 1 pager web app that calculates revenues over 1 year - with graphs etc.
+
+app.py: import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+import streamlit as st
+import datetime
+from src import entsoe_surrogate as es
+from src import entsoe_prices as ep
+from src import plot_day_ahead_market_prices as pu
+from src import optimize_battery_power_schedule as ob
+from src import bess_schedule_plotter as ps
+from src import degradation as dg
+
+# Initialize session state flags for simulations
+if 'run_ageing_sim' not in st.session_state:
+    st.session_state.run_ageing_sim = False
+if 'run_forecast_sim' not in st.session_state:
+    st.session_state.run_forecast_sim = False
+
+st.set_page_config(
+    page_title="BESS Optimizer Dashboard",
+    page_icon="⚡",
+)
+st.title("BESS Day-Ahead Market Trading")
+st.write(
+    "BESS Day-Ahead Market Trading is a tool written by Alessio Lodge (TNO) "
+    "that aims at providing a platform to evaluate BESS scheduling on the day-ahead market."
+)
+
+# 1️⃣ Inputs
+st.subheader("🌐📅 Choose Your Market and Date")
+col1, col2 = st.columns(2)
+with col1:
+    market = st.text_input(
+        "Market", "DE", max_chars=2,
+        help="ISO 2-letter code (DE, NL, FR…)"
+    )
+with col2:
+    trade_day = st.date_input(
+        "Day", value=datetime.date.today(),
+        max_value=datetime.date.today(),
+        format="YYYY-MM-DD",
+        help="Delivery date of the 24h block."
+    )
+
+st.subheader("🔧🔋 Define Your System")
+c1, c2 = st.columns(2)
+c3, c4 = st.columns(2)
+with c1:
+    capacity_kwh = st.number_input(
+        "Battery Capacity [kWh]", 0.0, step=0.1, format="%.1f", value=1000.0,
+        help="Usable energy the battery can store."
+    )
+with c2:
+    start_soc = st.number_input(
+        "Starting SOC [%]", 0, 100, value=50, step=1,
+        help="State of charge at the beginning (0–100%)."
+    )
+with c3:
+    p_discharge_max = st.number_input(
+        "Max Discharge Power [kW]", 0.0, step=0.1, format="%.1f", value=500.0,
+        help="Max discharging power (kW)."
+    )
+with c4:
+    p_charge_max = st.number_input(
+        "Max Charge Power [kW]", 0.0, step=0.1, format="%.1f", value=500.0,
+        help="Max charging power (kW)."
+    )
+
+# 2️⃣ Advanced Settings
+with st.expander("Advanced Settings"):
+    # Degradation cost toggle
+    add_deg_cost = st.toggle(
+        "Add cost based on battery degradation?",
+        value=False,
+        help="Include a usage-cost penalty?"
+    )
+    if add_deg_cost:
+        chemistry = st.selectbox(
+            "Chemistry", ("LFP", "NMC"), index=0,
+            help="Battery chemistry."
+        )
+        optimisation_routine = st.selectbox(
+            "Select Optimization Routine",
+            ("1: Non-linear LP", "2: Linear LP with best profit"),
+            index=0,
+            help="Solver variant (both identical for now)."
+        )
+        if st.button("🔄 Run simulation with ageing optimization", key="run_ageing"):
+            st.session_state.run_ageing_sim = True
+
+    # Imperfect knowledge toggle
+    add_imperfect_knowledge = st.toggle(
+        "Add imperfect knowledge of Day-ahead market",
+        value=False,
+        help=(
+            "The current model evaluates a schedule using the data of the day-ahead market, "
+            "known from 12:00 onwards. Selecting this method creates a schedule based on a forecast."
+        )
+    )
+    if add_imperfect_knowledge:
+        forecast_method = st.selectbox(
+            "Select Forecasting Method",
+            ("1: Statistical Method: LEAR", "2: Machine Learning Method: DNN"),
+            index=0,
+            help="Forecasting method for imperfect market knowledge."
+        )
+        if st.button("🔄 Run simulation with forecast", key="run_forecast"):
+            st.session_state.run_forecast_sim = True
+
+# 3️⃣ Fetch prices & run BASE simulation automatically
+api_key_entsoe = st.secrets["api_keys"]["entsoe"]
+prices = ep.get_day_ahead_prices_single_day(market, trade_day, api_key=api_key_entsoe)
+result_base = ob.optimise_battery(
+    prices, capacity_kwh, start_soc,
+    p_charge_max, p_discharge_max,
+    dt=1.0
+)
+
+# 4️⃣ Display BASE results when no advanced sim selected
+if not st.session_state.run_ageing_sim and not st.session_state.run_forecast_sim:
+    st.subheader("Day-Ahead Prices")
+    st.pyplot(pu.plot_day_ahead_prices(prices), use_container_width=True)
+    st.subheader("📈 Base Results (no ageing)")
+    st.markdown(f"**Expected revenue:** {result_base['revenue']:,.2f} €")
+    st.subheader("🕒 Schedule (no ageing penalty)")
+    st.pyplot(ps.plot_bess_schedule(
+        result_base["schedule"], country=market,
+        day=trade_day, e_nom=capacity_kwh
+    ), use_container_width=True)
+
+# 5️⃣ Ageing simulation
+if st.session_state.run_ageing_sim and add_deg_cost:
+    deg_params = dg.load_emperical_degradation_parameters(chemistry)
+    full_cost = capacity_kwh * 200
+    result_age = ob.optimise_battery_with_ageing_dp(
+        prices, capacity_kwh, start_soc,
+        p_charge_max, p_discharge_max,
+        298.15, deg_params, full_cost, dt=1.0
+    )
+    ref_act = ob.evaluate_schedule_with_ageing(
+        result_base["P"], prices, capacity_kwh,
+        start_soc, 298.15, deg_params,
+        full_cost, dt=1.0
+    )
+    st.subheader("📈 Advanced Results with Ageing-Cost Penalty")
+    st.pyplot(ps.plot_bess_schedule(
+        result_age["schedule"], country=market,
+        day=trade_day, e_nom=capacity_kwh
+    ), use_container_width=True)
+    ac, cc, cl = (
+        result_age["ageing_cost"], result_age["ageing_cost_cyclic"], result_age["ageing_cost_calendar"]
+    )
+    st.write("** Cost-penalty Optimized Results::**")
+    st.markdown(
+        f"- Profit: **{result_age['profit']:,.2f} €**\n"
+        f"- Revenue: **{result_age['revenue']:,.2f} €**\n"
+        f"- Ageing cost: **{ac:,.2f} € (cyclic {cc:,.2f} €, calendar {cl:,.2f} €) €**"
+    )
+
+    st.write("** Un-optimized Results:**")
+    st.markdown(
+        f"- Profit: **{ref_act['profit']:,.2f} €**\n"
+        f"- Revenue: **{ref_act['revenue']:,.2f} €**\n"
+        f"- Ageing cost: **{ref_act['ageing_cost']:,.2f} €**"
+    )
+    # plot unoptimized
+    st.pyplot(ps.plot_bess_schedule(
+        ref_act["schedule"], country=market,
+        day=trade_day, e_nom=capacity_kwh
+    ), use_container_width=True)
+
+# 6️⃣ Forecast-based simulation
+if st.session_state.run_forecast_sim and add_imperfect_knowledge:
+    # Placeholder for future forecast function
+    known_prices = ep.get_day_ahead_prices_single_day(market, trade_day, api_key=api_key_entsoe)
+    forecast_prices = known_prices # ep.get_forecasted_day_ahead_prices( market, trade_day, api_key=api_key_entsoe, method=forecast_method)
+    result_fc = ob.optimise_battery(
+        forecast_prices, capacity_kwh, start_soc,
+        p_charge_max, p_discharge_max,
+        dt=1.0)
+    result_known_price = ob.optimise_battery(
+        known_prices, capacity_kwh, start_soc,
+        p_charge_max, p_discharge_max,
+        dt=1.0)
+    st.subheader("📈 Forecast-based Results (Imperfect Knowledge)") 
+    st.pyplot(pu.plot_day_ahead_prices_normal_and_forecasted(known_prices, forecast_prices), use_container_width=True) 
+    st.markdown(f"**Expected revenue (Imperfect Knowledge - Forecast Based):** {result_fc['revenue']:,.2f} €")
+    st.markdown(f"**Expected revenue (Perfect Knowledge):** {result_known_price['revenue']:,.2f} €")
+    
+    st.write("** Schedule with Imperfect Knowledge of Prices:**")
+
+    st.pyplot(ps.plot_bess_schedule(
+        result_fc["schedule"], country=market,
+        day=trade_day, e_nom=capacity_kwh
+    ), use_container_width=True)
+
+    st.write("** Schedule with Perfect Knowledge of Prices:**")
+
+    st.pyplot(ps.plot_bess_schedule(
+        result_known_price["schedule"], country=market,
+        day=trade_day, e_nom=capacity_kwh
+    ), use_container_width=True)
+
+
+from matplotlib.dates import DateFormatter
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import datetime as dt
+
+def plot_bess_schedule(
+    schedule: pd.DataFrame,
+    country: str,
+    day: dt.date,
+    e_nom: float,
+    title_prefix: str = ""
+):
+    # Unpack and scale
+    t = pd.to_datetime(schedule["time"])
+    price = schedule["price €/kWh"] * 1000  # €/MWh
+    power = schedule["power kW"]
+    soc = schedule["SOC start"] * e_nom / 100  # → kWh
+
+    charge = np.where(power < 0, power, 0)  # negative bars
+    discharge = np.where(power > 0, power, 0)  # positive bars
+
+    revenue_per_hour = price * power * 1e-3  # €/MWh × kW = €/h
+
+    fig, (ax_soc, ax_price) = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
+    full_title = f"{title_prefix}Battery schedule – {country} {day}"
+    ax_soc.set_title(full_title)
+
+    # --- Upper panel: SOC and power ---
+    ax_soc.plot(t, soc, label="Energy (kWh)", color="black")
+    ax_soc.set_ylabel("Energy (kWh)")
+    ax_soc.set_ylim(-0.1 * e_nom, 1.1 * e_nom)
+
+    axp = ax_soc.twinx()
+    axp.bar(t, charge, width=0.03, alpha=0.6, label="Charge kW")
+    axp.bar(t, discharge, width=0.03, alpha=0.6, label="Discharge kW")
+    axp.set_ylabel("Power (kW)")
+    rng = max(abs(power)) * 1.1
+    axp.set_ylim(-rng, rng)
+
+    lines1, labs1 = ax_soc.get_legend_handles_labels()
+    lines2, labs2 = axp.get_legend_handles_labels()
+    ax_soc.legend(lines1 + lines2, labs1 + labs2, loc="upper right")
+
+    # --- Lower panel: price and revenue ---
+    # --- Lower panel: price and revenue (shared axis) ---
+    ax_price.axhline(0, color="grey", linestyle="--", linewidth=1)
+    
+    # Transparent price bars for context
+    ax_price.bar(t, price, width=0.03, color="black", alpha=0.2, label="Market Price (€/MWh)")
+
+    # Overlay revenue (€/h) using the same y-axis
+    ax_price.bar(t, revenue_per_hour, width=0.03, color="green", alpha=0.7, label="Revenue per Hour (€)")
+    
+    # Shared label and autoscale
+    ax_price.set_ylabel("Price (€/MWh) + Revenue (€)")
+    y_max = max(price.max(), revenue_per_hour.max(), abs(revenue_per_hour.min())) * 1.1
+    y_min = min(price.min(), revenue_per_hour.min()) * 1.1
+    ax_price.set_ylim(y_min, y_max)
+
+    ax_price.legend(loc="upper left")
+    ax_price.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+    ax_price.set_xlabel("Hour of Day")
+
+    fig.tight_layout()
+    return fig
+
+"""
+Live day‑ahead prices from ENTSO‑E.
+
+Requirements
+------------
+    pip install entsoe-py pandas
+
+This *lean* helper sticks to the original
+`country‑string → bidding‑zone‑code` table so you can extend it by hand.
+
+Add or change entries in the ``_BIDDING_ZONE`` dictionary below whenever you
+need another market.  If a zone ever fails with *NoMatchingDataError*, double
+check that the right ENTSO‑E bidding‑zone identifier is in the mapping.
+"""
+from __future__ import annotations
+from datetime import timedelta
+import datetime as dt
+from typing import Final
+import pandas as pd
+from entsoe import EntsoePandasClient  # returns a pandas Series
+import forecasting as fc
+# ---------------------------------------------------------------------------
+# 1)  Minimal mapping ISO‑2 / common names → ENTSO‑E bidding‑zone codes
+# ---------------------------------------------------------------------------
+_BIDDING_ZONE: Final[dict[str, str]] = {
+    # Core Central‑Western Europe
+    "DE": "DE_LU",           # Germany (+ Luxembourg)
+    "GERMANY": "DE_LU",
+    "LU": "DE_LU",          # Luxembourg (same zone as DE)
+    "LUXEMBOURG": "DE_LU",
+    "FR": "FR",             # France
+    "FRANCE": "FR",
+    "BE": "BE",             # Belgium
+    "BELGIUM": "BE",
+    "NL": "NL",             # Netherlands
+    "NETHERLANDS": "NL",
+
+    # Iberian Peninsula
+    "ES": "ES",             # Spain
+    "SPAIN": "ES",
+    "PT": "PT",             # Portugal (shares MIBEL market)
+    "PORTUGAL": "PT",
+
+    # British Isles
+    "GB": "GB",             # Great Britain bidding zone
+    "UK": "UK",             # Whole UK identifier (used by some data)
+    "UNITED KINGDOM": "UK",
+
+    # Nordics
+    "DK1": "DK_1",          # Jutland / Funen
+    "DK2": "DK_2",          # Zealand
+    "DK": "DK_1",           # default Denmark → west (edit to taste)
+    "SE4": "SE_4",          # Sweden — south (main export link to DE/NL)
+    "SE_4": "SE_4",
+    "NO2": "NO_2",          # Norway – south (link to NL/GB/DK)
+    "NO_2": "NO_2",
+
+    # Alps & neighbours
+    "CH": "CH",             # Switzerland
+    "SWITZERLAND": "CH",
+    "AT": "AT",             # Austria
+    "AUSTRIA": "AT",
+    "IT": "IT_NORD",
+    "ITALY": "IT_NORD",
+
+}
+
+
+def _to_bidding_zone(country: str) -> str:
+    """Return the ENTSO‑E bidding‑zone code for *country* (case‑insensitive)."""
+    try:
+        return _BIDDING_ZONE[country.upper()]
+    except KeyError as err:
+        raise ValueError(
+            f"Unknown country '{country}'. Please extend _BIDDING_ZONE with the correct ENTSO‑E code."
+        ) from err
+
+
+# ---------------------------------------------------------------------------
+# 2)  Public helper: get_day_ahead_prices
+# ---------------------------------------------------------------------------
+
+def get_day_ahead_prices_single_day(
+    country: str,
+    date: dt.date,
+    *,
+    api_key: str,
+) -> pd.DataFrame:
+    """Fetch ENTSO‑E day‑ahead prices for *country* on *date*.
+
+    Parameters
+    ----------
+    country  : "DE", "Germany", "FR", "NL", … (see ``_BIDDING_ZONE``)
+    date     : :class:`datetime.date`  – delivery day (calendar date)
+    api_key  : ENTSO‑E API key (Transparency Platform)
+    """
+    zone = _to_bidding_zone(country)
+
+    # ENTSO‑E expects tz‑aware timestamps in *Europe/Brussels*
+    start = pd.Timestamp(date, tz="Europe/Brussels")
+    end = start + pd.Timedelta(days=1)
+
+    client = EntsoePandasClient(api_key=api_key)
+    series = client.query_day_ahead_prices(zone, start=start, end=end)
+
+    # Convert to UTC and tidy up
+    df = (
+        series.tz_convert("Europe/Brussels")
+        .rename("price")
+        .to_frame()
+        .reset_index()
+        .rename(columns={"index": "time"})
+        .assign(country=country)
+        .sort_values("time", ignore_index=True)
+    )
+    return df
+
+def get_day_ahead_prices_range(
+    country: str,
+    start: dt.date,
+    end: dt.date,
+    *,
+    api_key: str,
+    tz_out: str = "Europe/Brussels",               # or "Europe/Brussels"
+) -> pd.DataFrame:
+    """
+    Day-ahead prices for *country* from 00:00 local on *start*
+    up to (but NOT including) 00:00 local on *end + 1 day*.
+
+    tz_out:  "UTC"  or  "Europe/Brussels"
+    """
+    zone = _to_bidding_zone(country)
+
+    # One day padding on each side so we can trim precisely
+    fetch_start = pd.Timestamp(start - timedelta(days=1), tz="Europe/Brussels")
+    fetch_end   = pd.Timestamp(end   + timedelta(days=2), tz="Europe/Brussels")
+
+    client = EntsoePandasClient(api_key=api_key)
+    series = client.query_day_ahead_prices(zone, start=fetch_start, end=fetch_end)
+
+    # Work *in Brussels time* so “delivery days” are easy to see
+    df = (
+        series.tz_convert("Europe/Brussels")
+        .rename("price")
+        .to_frame()
+        .reset_index()
+        .rename(columns={"index": "time"})
+        .assign(country=country)
+    )
+
+    # Trim to the exact window the user expects
+    window_start = pd.Timestamp(start, tz="Europe/Brussels")
+    window_end   = pd.Timestamp(end + timedelta(days=1), tz="Europe/Brussels")
+
+    df = df.loc[(df["time"] >= window_start) & (df["time"] < window_end)]
+
+    # Optional: convert to UTC for downstream code
+    if tz_out.upper() == "UTC":
+        df["time"] = df["time"].dt.tz_convert("UTC")
+
+    df = df.sort_values("time", ignore_index=True)
+    return df
+
+def get_forecasted_day_ahead_prices(country: str,date: dt.date,api_key: str) -> pd.DataFrame:
+    """Fetch ENTSO‑E day‑ahead prices for *country* on *date*.
+
+    Parameters
+    ----------
+    country  : "DE", "Germany", "FR", "NL", … (see ``_BIDDING_ZONE``)
+    date     : :class:`datetime.date`  – delivery day (calendar date)
+    api_key  : ENTSO‑E API key (Transparency Platform)
+    """
+    # ---------------------
+    # First, get regressors
+    # ---------------------
+    date_minus_7  = get_day_ahead_prices_single_day(country, date-7, api_key=api_key)
+    date_minus_3  = get_day_ahead_prices_single_day(country, date-3, api_key=api_key)
+    date_minus_2  = get_day_ahead_prices_single_day(country, date-2, api_key=api_key)
+    date_minus_2  = get_day_ahead_prices_single_day(country, date-1, api_key=api_key)
+    #LEAR = fc.load_model()
+    df_forecasted = get_day_ahead_prices_single_day(country, date, api_key=api_key)
+    return df_forecasted 
+
+# optimize_battery_power_schedule.py
+import numpy as np
+import pandas as pd
+import cvxpy as cp
+from scipy.optimize import minimize, Bounds, NonlinearConstraint
+
+def _pick_solver():
+    have = set(cp.installed_solvers())
+    for s in ("ECOS", "HiGHS", "SCS", "OSQP", "GLPK"):
+        if s in have:
+            return s
+    raise RuntimeError("No LP solver available for cvxpy")
+
+def optimise_battery(
+    prices: pd.DataFrame | pd.Series | np.ndarray,
+    e_nom: float,
+    soc0: float,
+    p_charge_max: float,
+    p_discharge_max: float,
+    dt: float = 1.0,
+) -> dict:
+    """
+    Solve the 24 h LP *and* give back a tidy schedule DataFrame.
+
+    Parameters
+    ----------
+    prices : DataFrame with 'time' + 'price' columns, or Series/ndarray of prices.
+    e_nom, soc0, p_charge_max, p_discharge_max, dt : see earlier version.
+
+    Returns
+    -------
+    {
+      "P"       : 1-D ndarray (kW)
+      "SOC"     : 1-D ndarray (len = T+1, fraction)
+      "revenue" : float (€)
+      "status"  : solver status string
+      "schedule": pandas.DataFrame  (time, price €/MWh, power MW, SOC start)
+    }
+    """
+    # --- coerce price vector & keep the time column if present -------------
+    if isinstance(prices, pd.DataFrame):
+        time_col   = prices["time"].to_numpy()
+        price_vec  = prices["price"].to_numpy(dtype=float)/1000
+    elif isinstance(prices, pd.Series):
+        time_col   = None
+        price_vec  = prices.to_numpy(dtype=float)/1000
+    else:  # ndarray
+        time_col   = None
+        price_vec  = np.asarray(prices, dtype=float).flatten()/1000
+
+    T = price_vec.size
+
+    # --- build LP ----------------------------------------------------------
+    P   = cp.Variable(T)
+    SOC = cp.Variable(T + 1)
+
+    constraints = [
+        SOC[0] == soc0,
+        SOC[1:] == SOC[:-1] - 100*(P * dt) / e_nom,
+        SOC >= 0, SOC <= 100,
+        P >= -p_charge_max,
+        P <=  p_discharge_max,
+    ]
+
+    revenue = cp.sum(cp.multiply(price_vec, P * dt))
+    prob    = cp.Problem(cp.Maximize(revenue), constraints)
+    prob.solve(solver=_pick_solver())
+
+    P_opt   = np.asarray(P.value,  dtype=float).ravel()
+    SOC_opt = np.asarray(SOC.value, dtype=float).ravel()
+
+    # --- build schedule DataFrame -----------------------------------------
+    sched = pd.DataFrame({
+        "time":        time_col if time_col is not None else np.arange(T),
+        "price €/kWh": price_vec.round(2),
+        "power kW":    P_opt.round(3),
+        "SOC start":   SOC_opt[:-1].round(3)
+    })
+    #print(P_opt)
+    #print(SOC_opt)
+    return dict(P=P_opt, SOC=SOC_opt, revenue=float(prob.value),
+                status=prob.status, schedule=sched)
+
+def optimise_battery_with_ageing_dp(
+    prices,                       # DataFrame | Series | ndarray (€/MWh)
+    e_nom: float,
+    soc0: float,                  # %  0‥100
+    p_charge_max: float,          # kW  (positive)
+    p_discharge_max: float,       # kW  (positive)
+    T_amb,                        # Kelvin  scalar or vector
+    degradation_parameters,       # [a,b,c,d,e,f,g,h,z]
+    full_cost_of_battery: float,  # €
+    dt: float = 1.0,              # h   step length
+    soc_step: float = 0.5,        # %   SOC grid
+    p_step: float  = 0.25,        # kW  power grid
+):
+    # ── prices → vector (€/kWh) and optional time column ──────────────────
+    if isinstance(prices, pd.DataFrame):
+        time_col  = prices["time"].to_numpy()
+        price_vec = prices["price"].to_numpy(dtype=float) / 1000.0
+    elif isinstance(prices, pd.Series):
+        time_col, price_vec = None, prices.to_numpy(dtype=float) / 1000.0
+    else:
+        time_col, price_vec = None, np.asarray(prices, float).flatten() / 1000.0
+
+    T = price_vec.size                                   # horizon length
+
+    # ── ambient temperature vector (Kelvin) ───────────────────────────────
+    T_amb = np.full(T, float(T_amb)) if np.isscalar(T_amb) \
+            else np.asarray(T_amb, float).flatten()
+
+    # ── pre-compute coefficients ──────────────────────────────────────────
+    a,b,c,d,e,f,g,h,z = degradation_parameters
+    k1    = a*T_amb**2 + b*T_amb + c
+    k2    = f*np.exp(h / T_amb) * (dt/24.0)**z          # calendar term
+    kT    = d*T_amb + e
+    rev_k = price_vec * dt                              # €/kW per step
+    alpha = dt * 1000.0 / 1500.0                        # kWh → Ah
+
+    # ── SOC grid & DP tables ──────────────────────────────────────────────
+    soc_grid = np.arange(0.0, 100.0 + 1e-12, soc_step)
+    G        = soc_grid.size
+    value    = -np.inf * np.ones((T+1, G))
+    policy   = np.zeros((T,   G))
+    value[T] = 0.0                                      # terminal profit
+
+    # ── backward dynamic programme ────────────────────────────────────────
+    for t in range(T-1, -1, -1):
+        for i, soc in enumerate(soc_grid):
+            # power range that keeps SOC in 0‥100 % next step
+            p_min_soc = -(soc       ) * e_nom / (100*dt)
+            p_max_soc = (100.0-soc) * e_nom / (100*dt)
+            p_min = max(-p_charge_max, p_min_soc)
+            p_max = min( p_discharge_max, p_max_soc)
+            if p_min > p_max:
+                continue
+
+            P_choices = np.arange(p_min, p_max + 1e-12, p_step)
+            if P_choices.size == 0:
+                continue
+
+            next_soc = soc - 100.0 * P_choices * dt / e_nom
+            next_idx = np.round(next_soc / soc_step).astype(int)
+            ok       = (next_idx >= 0) & (next_idx < G)
+            P_choices, next_idx = P_choices[ok], next_idx[ok]
+            if P_choices.size == 0:
+                continue
+
+            P_abs  = np.abs(P_choices)
+            Ah     = alpha * P_abs
+            Crate  = P_abs / e_nom
+            soc_bar = 0.5*(soc + next_soc[ok])
+
+            q_cyc = (k1[t] * np.exp(kT[t]*Crate) * Ah)        / 100.0
+            q_cal = (k2[t] * np.exp(g * soc_bar / 100.0))     / 100.0
+            step_profit = rev_k[t]*P_choices \
+                          - full_cost_of_battery*(q_cyc+q_cal)/40.0
+            tot = step_profit + value[t+1, next_idx]
+
+            best = np.argmax(tot)
+            value[t, i]  = tot[best]
+            policy[t, i] = P_choices[best]
+
+    # ── roll forward from soc0 ────────────────────────────────────────────
+    def idx(s): return int(round(s / soc_step))
+
+    P_opt   = np.zeros(T)
+    SOC_opt = np.zeros(T+1)
+    SOC_opt[0] = soc0
+
+    revenue = ageing_cyc = ageing_cal = 0.0
+    soc_i   = idx(soc0)
+
+    for t in range(T):
+        P = policy[t, soc_i]
+        P_opt[t] = P
+        soc_next = SOC_opt[t] - 100.0 * P * dt / e_nom
+        SOC_opt[t+1] = soc_next
+
+        P_abs  = abs(P)
+        Ah     = alpha * P_abs
+        Crate  = P_abs / e_nom
+        soc_bar = 0.5*(SOC_opt[t] + soc_next)
+
+        q_cyc = (k1[t]*np.exp(kT[t]*Crate)*Ah)          / 100.0
+        q_cal = (k2[t]*np.exp(g*soc_bar/100.0))         / 100.0
+        ageing_cyc += full_cost_of_battery*q_cyc / 40.0
+        ageing_cal += full_cost_of_battery*q_cal / 40.0
+        revenue    += rev_k[t]*P
+        soc_i       = idx(soc_next)
+
+    ageing_cost = ageing_cyc + ageing_cal
+    profit      = revenue - ageing_cost
+
+    # ── tidy schedule DataFrame (same format as your LP helper) ───────────
+    sched = pd.DataFrame({
+        "time":        time_col if time_col is not None else np.arange(T),
+        "price €/kWh": price_vec.round(4),
+        "power kW":    P_opt.round(3),
+        "SOC start":   SOC_opt[:-1].round(3),
+    })
+
+    return dict(
+        P                     = P_opt,
+        SOC                   = SOC_opt,
+        revenue               = revenue,
+        ageing_cost           = ageing_cost,
+        ageing_cost_cyclic    = ageing_cyc,
+        ageing_cost_calendar  = ageing_cal,
+        profit                = profit,
+        status                = f"DP optimum on {G}-point SOC grid "
+                                f"({soc_step:.2f} %); horizon {T} steps",
+        schedule              = sched,
+    )
+
+def optimise_battery_with_ageing(
+    prices: pd.DataFrame | pd.Series | np.ndarray,
+    e_nom: float,                # kWh  ( = battery_capacity )
+    soc0: float,                 # %    initial state-of-charge  [0‥100]
+    p_charge_max: float,         # kW   (<0 in optimisation)
+    p_discharge_max: float,      # kW
+    T_amb: np.ndarray | float,   # K, length-T vector or scalar
+    degradation_parameters,      # [a, b, c, d, e, f, g, h, z]
+    full_cost_of_battery: float, # €    replacement value of whole BESS
+    dt: float = 1.0,             # h    sampling interval
+    max_iter: int = 5000,
+) -> dict:
+    """
+    24-step non-linear revenue maximisation with cyclic + calendar ageing costs.
+
+        Q_loss_cyclic[t]   = (a·T² + b·T + c) · exp((d·T + e)·C_rate[t]) · |Ah[t]|
+        Q_loss_calendar[t] = f·exp(g·SOC̄[t]) · exp(h/T) · (1/24)^z
+
+        cost[t] = full_cost_of_battery · (Q_loss_cyclic + Q_loss_calendar) / 40
+
+    Returns the usual schedule dict plus:
+        ageing_cost_cyclic   – € total cyclic cost
+        ageing_cost_calendar – € total calendar cost
+    """
+    # ───── price vector & time column ──────────────────────────────────────
+    if isinstance(prices, pd.DataFrame):
+        time_col  = prices["time"].to_numpy()
+        price_vec = prices["price"].to_numpy(dtype=float) / 1000.0   # €/kWh
+    elif isinstance(prices, pd.Series):
+        time_col, price_vec = None, prices.to_numpy(dtype=float) / 1000.0
+    else:
+        time_col, price_vec = None, np.asarray(prices, dtype=float).flatten() / 1000.0
+
+    T = price_vec.size
+
+    # ───── ambient temperature vector ─────────────────────────────────────
+    if np.isscalar(T_amb):
+        T_amb = np.full(T, float(T_amb))
+    else:
+        T_amb = np.asarray(T_amb, dtype=float).flatten()
+        if T_amb.size != T:
+            raise ValueError("T_amb must be scalar or length = len(prices)")
+
+    # ───── pre-compute constants that never change during optimisation ────
+    a, b, c, d, e, f, g, h, z = degradation_parameters
+    k1  = a*T_amb**2 + b*T_amb + c                         # (T,)
+    k2  = f*np.exp(h / T_amb) * (1/24.0)**z                # (T,)
+    kT  = d*T_amb + e                                      # (T,)
+    rev_coeff = price_vec * dt                             # (T,)
+
+    alpha = dt * 1000.0 / 1500.0                                # kWh → Ah
+
+    # ───── helper functions ───────────────────────────────────────────────
+    def simulate_soc(P: np.ndarray) -> np.ndarray:
+        """Vectorised SOC trajectory (%) given power in kW."""
+        soc = np.empty(T + 1)
+        soc[0] = soc0
+        soc[1:] = soc0 - 100.0 * np.cumsum(P) * dt / e_nom
+        return soc
+
+    def profit_and_grad(P: np.ndarray):
+        """
+        Return objective (= negative profit) and its analytic gradient.
+        Positive P = discharge (sell); negative P = charge (buy).
+        """
+        # revenue part (linear)
+        revenue   = np.dot(rev_coeff, P)          # €
+        grad_rev  = rev_coeff                     # (T,)
+
+        # ---- ageing part -------------------------------------
+        P_abs  = np.abs(P)
+        Ah     = alpha * P_abs
+        C_rate = P_abs / e_nom
+
+        soc         = simulate_soc(P)
+        soc_bar     = 0.5 * (soc[:-1] + soc[1:])
+
+        exp1 = np.exp(kT * C_rate)
+        exp2 = np.exp(g * soc_bar / 100.0)
+
+        # ➊ divide by 100 *here*
+        q_loss_cyclic   = (k1 * exp1 * Ah) / 100.0
+        q_loss_calendar = (k2 * exp2)      / 100.0
+        q_loss          = q_loss_cyclic + q_loss_calendar
+
+        cost_cyclic_vec   = full_cost_of_battery * q_loss_cyclic   / 40.0
+        cost_calendar_vec = full_cost_of_battery * q_loss_calendar / 40.0
+        cost_total        = cost_cyclic_vec.sum() + cost_calendar_vec.sum()
+
+        # ---- gradient wrt P ---------------------------------------------
+        signP        = np.sign(P)
+        dCrate_dP    = signP / e_nom
+        dexp1_dP     = exp1 * kT * dCrate_dP
+
+        # gradient of cyclic cost (vector, length T)
+        dterm1_dP = (alpha/100.0) * (k1 * exp1 * signP + k1 * P_abs * dexp1_dP)
+
+        # gradient of calendar cost needs SOC̄ Jacobian --------------------
+        dsoc_dP  = -100.0 * dt / e_nom                    # scalar
+        J        = np.zeros((T, T))
+        idx      = np.arange(T)
+        J[idx, idx] = 0.5 * dsoc_dP
+        J[idx[:-1], idx[1:]] += 0.5 * dsoc_dP             # tridiagonal
+
+        dexp2_dP   = (exp2 * (g/100.0))[:, None] * J      # (T,T)
+        dterm2_dP = (k2/100.0)[:, None] * dexp2_dP
+
+        grad_cost = (full_cost_of_battery / 40.0) * (
+            dterm1_dP + dterm2_dP.sum(axis=0)
+        )
+
+        # final objective & gradient (negated because we minimise)
+        profit = revenue - cost_total
+        obj    = -profit
+        grad   = -(grad_rev - grad_cost)
+        return obj, grad
+
+    # wrappers for SciPy
+    def obj_only(P):  return profit_and_grad(P)[0]
+    def obj_grad(P):  return profit_and_grad(P)[1]
+
+    # ───── SOC constraints ────────────────────────────────────────────────
+    def soc_lower_fn(P):  return simulate_soc(P)[1:]            # ≥ 0
+    def soc_upper_fn(P):  return 100.0 - simulate_soc(P)[1:]    # ≥ 0
+
+    ineq_low  = NonlinearConstraint(soc_lower_fn,  0.0,  np.inf)
+    ineq_high = NonlinearConstraint(soc_upper_fn,  0.0,  np.inf)
+
+    # ───── optimisation call ──────────────────────────────────────────────
+    bounds = Bounds(-p_charge_max * np.ones(T), p_discharge_max * np.ones(T))
+    P0     = np.zeros(T)
+
+    res = minimize(
+        obj_only, P0,
+        jac=obj_grad,
+        bounds=bounds,
+        constraints=[ineq_low, ineq_high],
+        method="SLSQP",
+        options=dict(maxiter=max_iter, ftol=1e-6, disp=False),
+    )
+    if not res.success:
+        raise RuntimeError(f"Non-linear optimisation failed: {res.message}")
+
+    P_opt   = res.x
+    SOC_opt = simulate_soc(P_opt)
+
+    # ───── rebuild cost parts with the optimal P for reporting ────────────
+    P_abs  = np.abs(P_opt)
+    Ah     = alpha * P_abs
+    C_rate = P_abs / e_nom
+    soc_bar = 0.5 * (SOC_opt[:-1] + SOC_opt[1:])
+
+    exp1 = np.exp(kT * C_rate)
+    exp2 = np.exp(g * soc_bar / 100.0)
+
+    q_loss_cyclic   = (k1 * exp1 * Ah) / 100.0     # keep /100 here as well
+    q_loss_calendar = (k2 * exp2)      / 100.0
+    ageing_cost_cyclic   = float((full_cost_of_battery / 40.0) * q_loss_cyclic.sum())
+    ageing_cost_calendar = float((full_cost_of_battery / 40.0) * q_loss_calendar.sum())
+    revenue              = float(np.dot(price_vec * dt, P_opt))
+    profit               = revenue - (ageing_cost_cyclic + ageing_cost_calendar)
+
+    # ───── schedule DataFrame ─────────────────────────────────────────────
+    sched = pd.DataFrame({
+        "time":        time_col if time_col is not None else np.arange(T),
+        "price €/kWh": price_vec.round(4),
+        "power kW":    P_opt.round(3),
+        "SOC start":   SOC_opt[:-1].round(3),
+    })
+
+    # ───── return dict ────────────────────────────────────────────────────
+    return dict(
+        P=P_opt,
+        SOC=SOC_opt,
+        revenue=revenue,
+        ageing_cost=ageing_cost_cyclic + ageing_cost_calendar,
+        ageing_cost_cyclic=ageing_cost_cyclic,
+        ageing_cost_calendar=ageing_cost_calendar,
+        profit=profit,
+        status=res.message,
+        schedule=sched,
+    )
+
+# ---------------------------------------------------------------------------
+# Utility: evaluate any given power schedule with cyclic + calendar ageing
+# ---------------------------------------------------------------------------
+def evaluate_schedule_with_ageing(
+    schedule: pd.DataFrame | pd.Series | np.ndarray,
+    prices:   pd.DataFrame | pd.Series | np.ndarray,
+    e_nom:    float,                 # kWh   – battery capacity
+    soc0:     float,                 # %     – initial SOC [0‥100]
+    T_amb:    np.ndarray | float,    # K    – scalar or length-T vector
+    degradation_parameters,          # [a, b, c, d, e, f, g, h, z]
+    full_cost_of_battery: float,     # €     – replacement value of the BESS
+    dt:       float = 1.0,           # h     – time step
+) -> dict:
+    """
+    Financial assessment of *any* hourly power profile `schedule`
+    using the ageing model from `optimise_battery_with_ageing`.
+
+    Returns
+    -------
+    dict with keys: P, SOC, revenue, ageing_cost, ageing_cost_cyclic,
+                    ageing_cost_calendar, profit, status, schedule
+    """
+    # ───── pull power vector P (kW) and a matching time column ───────────
+    if isinstance(schedule, pd.DataFrame):
+        if "power kW" in schedule:
+            P = schedule["power kW"].to_numpy(dtype=float)
+        else:                          # treat whole row as numeric
+            P = schedule.to_numpy(dtype=float).flatten()
+        time_col = schedule["time"].to_numpy() if "time" in schedule else None
+    elif isinstance(schedule, pd.Series):
+        P, time_col = schedule.to_numpy(dtype=float), None
+    else:  # ndarray
+        P, time_col = np.asarray(schedule, dtype=float).flatten(), None
+
+    # ───── obtain price vector (€/kWh) ────────────────────────────────────
+    if isinstance(prices, pd.DataFrame):
+        price_vec = prices["price"].to_numpy(dtype=float) / 1000.0
+        if time_col is None and "time" in prices:
+            time_col = prices["time"].to_numpy()
+    elif isinstance(prices, pd.Series):
+        price_vec = prices.to_numpy(dtype=float) / 1000.0
+    else:
+        price_vec = np.asarray(prices, dtype=float).flatten() / 1000.0
+
+    T = price_vec.size
+    assert len(P) == T, "schedule and price series must have identical length"
+
+    # ───── ambient temperature vector ─────────────────────────────────────
+    if np.isscalar(T_amb):
+        T_amb = np.full(T, float(T_amb))
+    else:
+        T_amb = np.asarray(T_amb, dtype=float).flatten()
+        if T_amb.size != T:
+            raise ValueError("T_amb must be scalar or length = len(prices)")
+
+    # ───── constants shared with the optimisation routine ────────────────
+    a, b, c, d, e, f, g, h, z = degradation_parameters
+    k1 = a*T_amb**2 + b*T_amb + c                    # (T,)
+    k2 = f*np.exp(h / T_amb) * (1/24.0)**z           # (T,)
+    kT = d*T_amb + e                                 # (T,)
+
+    alpha = 1000.0 / 1500.0                          # kWh → Ah conversion
+
+    # ───── simulate SOC trajectory (%) ───────────────────────────────────
+    SOC = np.empty(T + 1)
+    SOC[0] = soc0
+    SOC[1:] = soc0 - 100.0 * np.cumsum(P) * dt / e_nom
+
+    # ───── revenue (positive = income) ───────────────────────────────────
+    revenue = float(np.dot(price_vec * dt, P))       # €
+
+    # ───── ageing losses and costs ───────────────────────────────────────
+    P_abs   = np.abs(P)
+    Ah      = alpha * P_abs
+    C_rate  = P_abs / e_nom
+    soc_bar = 0.5 * (SOC[:-1] + SOC[1:])             # hourly mean SOC %
+
+    exp1 = np.exp(kT * C_rate)
+    exp2 = np.exp(g * soc_bar / 100.0)
+
+    # % capacity lost *per hour*
+    q_loss_cyclic   = k1 * exp1 * Ah       / 100.0
+    q_loss_calendar = k2 * exp2            / 100.0
+
+    ageing_cost_cyclic   = float((full_cost_of_battery / 40.0) * q_loss_cyclic.sum())
+    ageing_cost_calendar = float((full_cost_of_battery / 40.0) * q_loss_calendar.sum())
+    ageing_cost_total    = ageing_cost_cyclic + ageing_cost_calendar
+
+    profit = revenue - ageing_cost_total
+
+    # ───── schedule DataFrame for reporting ──────────────────────────────
+    sched = pd.DataFrame({
+        "time":        time_col if time_col is not None else np.arange(T),
+        "price €/kWh": price_vec.round(4),
+        "power kW":    P.round(3),
+        "SOC start":   SOC[:-1].round(3),
+    })
+
+    # ───── return everything in familiar format ──────────────────────────
+    return dict(
+        P=P,
+        SOC=SOC,
+        revenue=revenue,
+        ageing_cost=ageing_cost_total,
+        ageing_cost_cyclic=ageing_cost_cyclic,
+        ageing_cost_calendar=ageing_cost_calendar,
+        profit=profit,
+        status="evaluated",
+        schedule=sched,
+    )
+"""
+Utility helpers for building a Day‑Ahead‑price dataframe
+and plotting it.
+
+Dependencies:
+    pandas
+    matplotlib
+"""
+
+from __future__ import annotations
+import datetime as dt
+import pandas as pd
+from matplotlib import pyplot as plt
+from matplotlib.dates import DateFormatter
+
+
+def create_day_ahead_price_df(
+    country: str,
+    date: dt.date,
+    hourly_prices: list[float],
+) -> pd.DataFrame:
+    """
+    Build a tidy dataframe with one row per hour.
+
+    Columns
+    -------
+    time      : datetime64[ns] – hours 0‑23 on *date*
+    price     : float          – €/MWh
+    country   : string
+    """
+
+    if len(hourly_prices) != 24:
+        raise ValueError("hourly_prices must contain exactly 24 values")
+
+    times = [dt.datetime.combine(date, dt.time(hour=h)) for h in range(24)]
+
+    df = pd.DataFrame(
+        {"time": times, "price": hourly_prices}
+    ).assign(country=country)
+
+    return df
+
+
+def plot_day_ahead_prices(
+    price_df: pd.DataFrame,
+    country: str | None = None,
+    date: dt.date | None = None,
+    *,
+    figsize: tuple[int, int] = (11, 6),
+    title_suffix: str = "",
+    bar_width: float = 0.02,  # thinner default columns
+):
+    """
+    Bar‑plot of Day‑Ahead prices.
+
+    Supply either *country* and *date* explicitly or leave them as
+    None – they will be inferred from the dataframe if present.
+
+    Extra Parameters
+    ----------------
+    bar_width : float, default 0.02
+        Width of the hourly bars (useful for making columns visually thinner).
+    """
+    print(price_df)
+    # ── infer labels ──────────────────────────────────────────────────────────
+    if country is None:
+        country = price_df.get("country", ["Unknown"]).iloc[0]
+    if date is None:
+        # take the date part of the first timestamp
+        date = price_df["time"].dt.date.iloc[0]
+
+    # ── plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.bar(price_df["time"], price_df["price"], width=bar_width, alpha=0.75, color="black")
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Price (€/MWh)")
+
+    ax.set_title(
+        f"Day‑Ahead Market Prices – {country} – {date:%d %b %Y} {title_suffix}"
+    )
+
+    # centre the y‑axis around 0 so negative hours stand out
+    price_range = max(abs(price_df["price"].max()), abs(price_df["price"].min())) * 1.1
+    ax.set_ylim(-price_range, price_range)
+    ax.axhline(0, linewidth=0.8, linestyle="--", color="grey")
+
+    # show only HH:MM on the x‑axis (no date)
+    ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+    ax.tick_params(axis="x", rotation=-45)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig
+
+
+def plot_day_ahead_prices_normal_and_forecasted(
+    price_known_df: pd.DataFrame,
+    price_forecast_df: pd.DataFrame,
+    country: str | None = None,
+    date: dt.date | None = None,
+    *,
+    figsize: tuple[int, int] = (11, 6),
+    title_suffix: str = "",
+    bar_width: float = 0.02,  # thinner default columns
+):
+    """
+    Bar‑plot of Day‑Ahead prices.
+
+    Supply either *country* and *date* explicitly or leave them as
+    None – they will be inferred from the dataframe if present.
+
+    Extra Parameters
+    ----------------
+    bar_width : float, default 0.02
+        Width of the hourly bars (useful for making columns visually thinner).
+    """
+    print(price_known_df)
+    # ── infer labels ──────────────────────────────────────────────────────────
+    if country is None:
+        country = price_known_df.get("country", ["Unknown"]).iloc[0]
+    if date is None:
+        # take the date part of the first timestamp
+        date = price_known_df["time"].dt.date.iloc[0]
+
+    # ── plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.bar(price_known_df["time"], price_known_df["price"],
+        width=bar_width, alpha=0.6, color="lightgrey")
+    ax.bar(price_forecast_df["time"], price_forecast_df["price"],
+       width=bar_width, alpha=0.8, color="crimson")
+
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Price (€/MWh)")
+
+    ax.set_title(
+        f"Day‑Ahead Market Prices – {country} – {date:%d %b %Y} {title_suffix}"
+    )
+
+    # centre the y‑axis around 0 so negative hours stand out
+    price_range = max(abs(price_known_df["price"].max()), abs(price_known_df["price"].min())) * 1.1
+    ax.set_ylim(-price_range, price_range)
+    ax.axhline(0, linewidth=0.8, linestyle="--", color="grey")
+
+    # show only HH:MM on the x‑axis (no date)
+    ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+    ax.tick_params(axis="x", rotation=-45)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig
+# src/revenue_plotter.py
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+from matplotlib.dates import DateFormatter
+
+
+def plot_daily_and_cumulative_revenue(
+    revenue_df: pd.DataFrame,
+    *,
+    bar_color: str = "black",          # thin black bars
+    line_color: str = "#80bfff",       # light-blue cumulative line
+    bar_width: float = 0.20,           # MUCH thinner bars (≈ 5 h wide on a daily axis)
+    bar_alpha: float = 0.95,           # match the 75 % opacity
+    fig_size: tuple[int, int] = (12, 6),
+    dpi: int = 300,
+    font_size: int = 14,
+    title_suffix: str = "",
+):
+    """
+    Bar (daily €) + line (cumulative €) chart with dual y-axes,
+    using the same look-and-feel as plot_day_ahead_prices.
+
+    Parameters
+    ----------
+    revenue_df : DataFrame with columns 'date' and 'revenue_eur'.
+    bar_color  : colour for the daily-revenue columns.
+    line_color : colour for the cumulative-revenue line.
+    bar_width  : bar width in matplotlib date units (≈ days).
+    bar_alpha  : opacity of the bars (0-1).
+    fig_size   : (width, height) in inches.
+    dpi        : figure resolution.
+    font_size  : base font size for labels & ticks.
+    title_suffix : optional string appended to the automatic title.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    # ── prepare data ───────────────────────────────────────────────
+    df = revenue_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df.sort_values("date", inplace=True)
+    df["cum_revenue"] = df["revenue_eur"].cumsum()
+
+    # ── matplotlib styling ────────────────────────────────────────
+    plt.rcParams.update({
+        "font.size": font_size,
+        "axes.labelsize": font_size + 1,
+        "axes.titlesize": font_size + 2,
+        "xtick.labelsize": font_size,
+        "ytick.labelsize": font_size,
+    })
+
+    fig, ax = plt.subplots(figsize=fig_size, dpi=dpi)
+
+    # Bars: daily revenue (thin, semi-transparent)
+    ax.bar(
+        df["date"],
+        df["revenue_eur"],
+        color=bar_color,
+        width=bar_width,
+        alpha=bar_alpha,
+        label="Daily revenue",
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Daily revenue [€]")
+    ax.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+
+    # Symmetric y-axis around 0 *if* we have losses as well
+    rev_max = df["revenue_eur"].max()
+    rev_min = df["revenue_eur"].min()
+    if rev_min < 0:
+        y_lim = max(abs(rev_max), abs(rev_min)) * 1.1
+        ax.set_ylim(-y_lim, y_lim)
+        ax.axhline(0, linewidth=0.8, linestyle="--", color="grey")
+
+    # Line: cumulative revenue
+    ax2 = ax.twinx()
+    ax2.plot(
+        df["date"],
+        df["cum_revenue"],
+        color=line_color,
+        linewidth=2.5,
+        label="Cumulative revenue",
+    )
+    ax2.set_ylabel("Cumulative revenue [€]")
+    ax2.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+
+    # X-axis formatting — show “DD Mon” and rotate like the day-ahead plot
+    ax.xaxis.set_major_formatter(DateFormatter("%d %b"))
+    ax.tick_params(axis="x", rotation=-45)
+
+    # Title in the same style: “Daily & Cumulative Revenue – 01 Jan 2025 – 31 Jan 2025”
+    start, end = df["date"].iloc[0], df["date"].iloc[-1]
+    ax.set_title(
+        f"Daily & Cumulative Revenue – {start:%d %b %Y} – {end:%d %b %Y} {title_suffix}"
+    )
+
+    # Combined legend (upper-left, frame-free to match price plot)
+    handles, labels = [], []
+    for axis in (ax, ax2):
+        h, l = axis.get_legend_handles_labels()
+        handles.extend(h)
+        labels.extend(l)
+    ax.legend(handles, labels, loc="upper left", frameon=False)
+
+    fig.tight_layout()
+    return fig
+import streamlit as st
+
+# ----------------------------------------------------------------------------
+# 📚 Documentation page for the BESS Day-Ahead Market Optimiser
+# ----------------------------------------------------------------------------
+# This Streamlit page is displayed under ``pages/`` so that users can open it
+# from the navbar and quickly understand what the tool is, why it exists and
+# how to operate it.
+# ----------------------------------------------------------------------------
+
+def main():  # pragma: no cover
+    """Render the documentation page."""
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+    st.title("Documentation")
+    st.caption("Version 0.3 · last updated 2025‑05‑25")
+
+    # ------------------------------------------------------------------
+    # Context section
+    # ------------------------------------------------------------------
+    st.header("Context")
+    st.markdown(
+        """
+        ### Day‑Ahead Trading of Electricity
+        *Day‑ahead trading* refers to buying and selling electricity **one day before**
+        physical delivery. A daily auction held by the power exchange (e.g. **EPEX
+        SPOT**, **Nord Pool**, **PJM**) produces **24 hourly prices** for the next day.
+
+        Market participants – called **balancing‑responsible parties (BRPs)** – use the
+        auction to keep the net position of their *balancing group* at zero. Surplus
+        generation is sold; unexpected demand is bought.
+
+        ### Why optimise a Battery Energy Storage System (BESS)?
+        A BESS can **charge when prices are low (or negative)** and **discharge when they
+        are high**, capturing the spread and supporting grid flexibility. The goal is to
+        choose an hourly power profile (schedule) that maximises revenue while respecting
+        battery *state‑of‑charge (SOC)* limits.
+
+        ### Linear Programming (LP)
+        The scheduling task is formulated as a **linear‑programming (LP) problem** – a
+        linear objective subject to linear constraints. LP guarantees a globally
+        optimal solution in milliseconds (solved here with
+        `cvxpy`).
+
+        ### Day-Ahead Market Data
+        While its is not possible in reality to know the prices of the day-ahead market of a following day,
+        this programme allows to run a ''backtest'', simulating the revenues made in the ideal scenario of being able to train arbitrary amounts of energy
+        with a known prices spread. The data is provided via API from the entsoe transparency platform.
+
+        ### Cost penalty for ageing
+        Cyling the battery once a day or twice a day, while maintaing different average SOCs will have different effects of 
+        the ageing of the BESS. We can incoporate a cost to include the burden of degrading more the BESS when it is used more.
+        By modelling the capacity fade, we can compute a cost by attributing a capacity fade of 40% to a loss equal to the inital cost of the system.
+        Each fraction of that capacity loss with therefore 'cost' a share of the initial CAPEX.
+        """,
+        unsafe_allow_html=False,
+    )
+
+    # ------------------------------------------------------------------
+    # Usage section
+    # ------------------------------------------------------------------
+    st.header("Usage")
+
+    st.markdown(
+        """
+        1. **Select Dates and Market**  
+           Select the market (DE, FR, ES etc.) and date (i.e. 2025-05-25) to simulate revenues on day-ahead market. 
+           This will load the day-ahead data  from the ENTSOE Transparency Platform**.
+
+        2. **Define System conditions**  
+           * Battery **energy capacity** (kWh) 
+           * Starting **SOC** (0 – 100 %)   
+           * Charge/Discharge **power limit** (kW)
+           * Optional: add usage-aware revenue which adds a cost to abusive usage conditions**
+
+        3. **Run optimisation**  
+           The app solves the LP and returns: 
+           * The **expected revenue** for the day 
+           * An **optimal power schedule** (kW per hour)  
+           * The resulting **SOC trajectory**  
+
+        4. **Inspect results**  
+           Interactive charts display price, power and SOC. Download data as CSV for
+           further analysis.
+        """,
+        unsafe_allow_html=False,
+    )
+
+    # ------------------------------------------------------------------
+    # Mathematical formulation (now in an expander with proper LaTeX)
+    # ------------------------------------------------------------------
+    with st.expander("Mathematical formulation of Optimal Power Dispatch (no-usage penalty)", expanded=False):
+        st.subheader("Optimisation objective")
+        st.latex(r"\max_{P_1,\dots,P_{24}} \; \sum_{h=1}^{24} P_h\,Price_h\,\Delta t")
+        st.markdown(
+            "* **Power**: $P_h < 0$ when charging, $P_h > 0$ when discharging (kW)  \n"
+            "* **Price**: $Price_h$ is the day‑ahead price for hour $h$ (€/MWh)  \n"
+            "* **Time‑step**: $\\Delta t = 1\\,\\text{h}$",
+            unsafe_allow_html=False,
+        )
+
+        st.subheader("State‑of‑Charge (SOC) dynamics")
+        st.latex(r"\text{SOC}_{h} = \text{SOC}_{h-1} + \frac{P_h\,\Delta t}{E_{\text{nom}}}")
+        st.latex(r"0 \le \text{SOC}_{h} \le 1 \qquad \forall\,h")
+
+        st.subheader("Decision variables")
+        st.markdown(
+            "Hourly powers $P_1,\dots,P_{24}$. All relationships above are linear, so the"
+            " problem is solvable with standard LP solvers in milliseconds.",
+            unsafe_allow_html=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Footer/help
+    # ------------------------------------------------------------------
+    st.info(
+        "Need help? Reach out via the *Feedback* link in the sidebar or consult the"
+        " README on GitHub.",
+        icon="💡",
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
