@@ -18,11 +18,26 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter
+import matplotlib.ticker as ticker
+from matplotlib.dates import DateFormatter, MonthLocator
 
 # allow: from src import ...
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from src import entsoe_prices as ep  # uses get_day_ahead_prices_range
+
+# ── Shared matplotlib style (matches BESS dashboard) ──────────────────────────
+_FONT_SIZE = 13
+_DPI = 300
+_FIG_W = 12
+
+def _apply_style():
+    plt.rcParams.update({
+        "font.size": _FONT_SIZE,
+        "axes.labelsize": _FONT_SIZE + 1,
+        "axes.titlesize": _FONT_SIZE + 2,
+        "xtick.labelsize": _FONT_SIZE,
+        "ytick.labelsize": _FONT_SIZE,
+    })
 
 # ---------------------------
 # Optimizer (1-year LP w/ efficiency)
@@ -55,8 +70,8 @@ def optimise_ldes_year(
       power_mw < 0  => charge (buy)
 
     Efficiency model:
-      SOC_{t+1} = SOC_t + eta_c * Pc_t*dt - (1/eta_d) * Pd_t*dt
-      with Pc,Pd >= 0 and eta_c = eta_d = sqrt(eta_rt)
+      SOC_{t+1} = SOC_t + η_c·Pc_t·dt - (1/η_d)·Pd_t·dt
+      with Pc, Pd ≥ 0 and η_c = η_d = √η_rt
     """
     import cvxpy as cp
 
@@ -140,9 +155,10 @@ def optimise_ldes_year(
 
 
 # ---------------------------
-# Plot helpers (matplotlib, lightweight)
+# Plot helpers  (BESS-style)
 # ---------------------------
 def plot_price_series(df: pd.DataFrame, max_points: int = 2500):
+    _apply_style()
     d = df.copy()
     d["time"] = pd.to_datetime(d["time"])
     d = d.sort_values("time")
@@ -150,16 +166,22 @@ def plot_price_series(df: pd.DataFrame, max_points: int = 2500):
         step = int(np.ceil(len(d) / max_points))
         d = d.iloc[::step, :]
 
-    fig, ax = plt.subplots(figsize=(12, 4), dpi=150)
-    ax.plot(d["time"], d["price"], linewidth=1.0)
+    fig, ax = plt.subplots(figsize=(_FIG_W, 4), dpi=_DPI)
+    ax.plot(d["time"], d["price"], linewidth=1.0, color="black")
+    ax.axhline(0, linewidth=0.8, linestyle="--", color="grey")
+    ax.set_xlabel("Date")
     ax.set_ylabel("Price (€/MWh)")
     ax.set_title("Day-ahead prices (downsampled for display)")
-    ax.xaxis.set_major_formatter(DateFormatter("%b"))
+    ax.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+    ax.xaxis.set_major_locator(MonthLocator())
+    ax.xaxis.set_major_formatter(DateFormatter("%b %Y"))
+    ax.tick_params(axis="x", rotation=-45)
     fig.tight_layout()
     return fig
 
 
 def plot_soc_and_power(schedule: pd.DataFrame, e_max_mwh: float, max_points: int = 2500):
+    _apply_style()
     d = schedule.copy()
     d["time"] = pd.to_datetime(d["time"])
     d = d.sort_values("time")
@@ -167,22 +189,32 @@ def plot_soc_and_power(schedule: pd.DataFrame, e_max_mwh: float, max_points: int
         step = int(np.ceil(len(d) / max_points))
         d = d.iloc[::step, :]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), dpi=150, sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(_FIG_W, 6), dpi=_DPI, sharex=True)
 
-    ax1.plot(d["time"], d["soc_mwh_start"], linewidth=1.2)
+    ax1.plot(d["time"], d["soc_mwh_start"], linewidth=1.2, color="black")
     ax1.set_ylabel("SOC (MWh)")
     ax1.set_ylim(-0.02 * e_max_mwh, 1.02 * e_max_mwh)
+    ax1.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
     ax1.set_title("Optimized SOC and power (downsampled for display)")
 
-    ax2.axhline(0, linestyle="--", linewidth=1)
-    ax2.plot(d["time"], d["power_mw"], linewidth=1.0)
-    ax2.set_ylabel("Power (MW)  (+ discharge / - charge)")
-    ax2.xaxis.set_major_formatter(DateFormatter("%b"))
+    charge = np.where(d["power_mw"] < 0, d["power_mw"], 0)
+    discharge = np.where(d["power_mw"] > 0, d["power_mw"], 0)
+    ax2.axhline(0, linestyle="--", linewidth=0.8, color="grey")
+    ax2.bar(d["time"], charge, width=1.0, alpha=0.6, color="steelblue", label="Charge (MW)")
+    ax2.bar(d["time"], discharge, width=1.0, alpha=0.6, color="darkorange", label="Discharge (MW)")
+    ax2.set_ylabel("Power (MW)  (+ discharge / − charge)")
+    ax2.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.1f}"))
+    ax2.xaxis.set_major_locator(MonthLocator())
+    ax2.xaxis.set_major_formatter(DateFormatter("%b %Y"))
+    ax2.tick_params(axis="x", rotation=-45)
+    ax2.legend(loc="upper right", frameon=False)
+
     fig.tight_layout()
     return fig
 
 
 def plot_daily_and_cumulative_revenue(schedule: pd.DataFrame):
+    _apply_style()
     d = schedule.copy()
     d["time"] = pd.to_datetime(d["time"])
     d["date"] = d["time"].dt.date
@@ -191,22 +223,31 @@ def plot_daily_and_cumulative_revenue(schedule: pd.DataFrame):
     daily = daily.sort_values("date", ignore_index=True)
     daily["cum_revenue"] = daily["revenue_eur"].cumsum()
 
-    fig, ax = plt.subplots(figsize=(12, 4.8), dpi=150)
-    ax.bar(daily["date"], daily["revenue_eur"], width=0.8, alpha=0.85, label="Daily revenue (€)")
-    ax.set_ylabel("Daily revenue (€)")
-    ax.xaxis.set_major_formatter(DateFormatter("%b"))
+    fig, ax = plt.subplots(figsize=(_FIG_W, 5), dpi=_DPI)
 
-    # symmetric around 0 if negatives exist
+    # thin black daily bars
+    ax.bar(daily["date"], daily["revenue_eur"], width=0.8, alpha=0.85, color="black", label="Daily revenue (€)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Daily revenue (€)")
+    ax.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+
     rmax = float(daily["revenue_eur"].max())
     rmin = float(daily["revenue_eur"].min())
     if rmin < 0:
         lim = max(abs(rmax), abs(rmin)) * 1.1
         ax.set_ylim(-lim, lim)
-        ax.axhline(0, linestyle="--", linewidth=1)
+        ax.axhline(0, linestyle="--", linewidth=0.8, color="grey")
 
+    # black cumulative line on twin axis
     ax2 = ax.twinx()
-    ax2.plot(daily["date"], daily["cum_revenue"], linewidth=2.0, label="Cumulative revenue (€)")
+    ax2.plot(daily["date"], daily["cum_revenue"], linewidth=2.5, color="black", label="Cumulative revenue (€)")
     ax2.set_ylabel("Cumulative revenue (€)")
+    ax2.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+
+    # x-axis: "Jan 2024" style
+    ax.xaxis.set_major_locator(MonthLocator())
+    ax.xaxis.set_major_formatter(DateFormatter("%b %Y"))
+    ax.tick_params(axis="x", rotation=-45)
 
     # combined legend
     h1, l1 = ax.get_legend_handles_labels()
@@ -215,7 +256,7 @@ def plot_daily_and_cumulative_revenue(schedule: pd.DataFrame):
 
     start = daily["date"].iloc[0]
     end = daily["date"].iloc[-1]
-    ax.set_title(f"Daily & cumulative revenue — {start:%d %b %Y} to {end:%d %b %Y}")
+    ax.set_title(f"Daily & Cumulative Revenue — {start:%d %b %Y} to {end:%d %b %Y}")
     fig.tight_layout()
     return fig
 
@@ -227,6 +268,11 @@ st.set_page_config(page_title="LDES Merchant DA Revenue (1-year)", page_icon="�
 st.title("LDES Merchant Day-Ahead Revenue — 1-year perfect-foresight backtest")
 
 left, right = st.columns([1.0, 1.2], gap="large")
+
+# Container / cost reference values
+_MWH_PER_CONTAINER = 1.0          # MWh per container
+_M2_PER_CONTAINER = 14.8          # m² per container
+_M2_PER_ACRE = 4_046.856          # m² per acre
 
 with left:
     st.subheader("Market + year")
@@ -250,6 +296,31 @@ with left:
         help="For annual backtests, 'same_as_start' is often the cleanest assumption.",
     )
 
+    st.subheader("System cost & footprint")
+    cost_per_kwh = st.number_input(
+        "Specific cost (EUR/kWh)", min_value=0.0, value=30.0, step=1.0,
+        help="Capital cost per kWh of installed energy capacity.",
+    )
+    mwh_per_container = st.number_input(
+        "Energy per container (MWh)", min_value=0.01, value=float(_MWH_PER_CONTAINER), step=0.1,
+        help="Rated energy content of one storage container.",
+    )
+    m2_per_container = st.number_input(
+        "Footprint per container (m²)", min_value=0.1, value=float(_M2_PER_CONTAINER), step=0.1,
+        help="Ground footprint of one container.",
+    )
+
+    # Live-calculated system sizing
+    total_cost_eur = e_max_mwh * 1_000.0 * cost_per_kwh
+    n_containers = e_max_mwh / mwh_per_container if mwh_per_container > 0 else 0.0
+    total_m2 = n_containers * m2_per_container
+    total_acres = total_m2 / _M2_PER_ACRE
+
+    sc1, sc2, sc3 = st.columns(3)
+    sc1.metric("System CAPEX", f"€ {total_cost_eur:,.0f}")
+    sc2.metric("Containers", f"{n_containers:,.1f}")
+    sc3.metric("Footprint", f"{total_acres:.3f} acres")
+
     run = st.button("Run 1-year backtest", type="primary")
 
 with right:
@@ -261,8 +332,9 @@ with right:
     )
     st.write(
         "Model uses separate charge/discharge variables and an SOC balance with efficiency "
-        "ηc = ηd = √ηrt."
+        "η_c = η_d = √η_rt (one-way efficiency equals the square root of the round-trip efficiency)."
     )
+
 
 # ---------------------------
 # Data load (cached)
@@ -308,7 +380,7 @@ if run:
 
     with st.spinner("Solving 1-year LP..."):
         res = optimise_ldes_year(
-            prices_df=prices.rename(columns={"price": "price"}),  # keep name
+            prices_df=prices,
             e_max_mwh=float(e_max_mwh),
             p_charge_max_mw=float(p_mw),
             p_discharge_max_mw=float(p_mw),
@@ -324,12 +396,14 @@ if run:
     total_rev = float(sched["revenue_eur"].sum())
     avg_rev_day = total_rev / 365.0
     duration_h = (e_max_mwh / p_mw) if (p_mw > 0) else np.inf
+    rev_per_kwh = total_rev / (e_max_mwh * 1_000.0) if e_max_mwh > 0 else 0.0
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total revenue (€)", f"{total_rev:,.0f}")
-    k2.metric("Avg revenue per day (€)", f"{avg_rev_day:,.0f}")
-    k3.metric("Equivalent cycles (throughput / 2E)", f"{res['equiv_cycles']:.2f}")
-    k4.metric("Duration (E/P)", f"{duration_h:.1f} h")
+    k2.metric("Avg revenue / day (€)", f"{avg_rev_day:,.0f}")
+    k3.metric("Revenue / kWh installed", f"{rev_per_kwh:.2f} €/kWh")
+    k4.metric("Equivalent cycles (throughput / 2E)", f"{res['equiv_cycles']:.2f}")
+    k5.metric("Duration (E/P)", f"{duration_h:.1f} h")
 
     # Plots
     st.subheader("Prices")
